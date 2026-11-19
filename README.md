@@ -1,5 +1,21 @@
 # Day 11 — Controlled Agent Security (2026)
 
+> **Học viên:** Nguyễn Đắc Tuấn Nghĩa · **MSSV:** 2A202603442 · **Lớp:** K5-L3A
+>
+> **Cách chạy nhanh** (Python 3.12 — `nemoguardrails` chưa hỗ trợ 3.14):
+>
+> ```powershell
+> py -3.12 -m venv .venv; .\.venv\Scripts\Activate.ps1
+> pip install -r requirements.txt      # rồi điền .env từ .env.example
+> python src/main.py --part 2          # CP2 guardrails (in terminal)
+> python src/main.py --part 3          # CP3 → outputs/results.json, audit_log.json, metrics.json
+> python src/main.py --part 4          # CP4 → outputs/attack_results.json (+ unsafe/guards)
+> python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+> ```
+>
+> Kết quả lần chạy nộp: safe bị chặn 0/7 · attack bị chặn 10/10 · rate limit 5/15 bị chặn ·
+> Red leak 5/5 · Red Advance leak 0/5 (xem `outputs/lab_report.md`, tự sinh).
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).

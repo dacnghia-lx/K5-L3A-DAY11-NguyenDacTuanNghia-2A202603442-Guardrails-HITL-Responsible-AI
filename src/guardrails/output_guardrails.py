@@ -37,29 +37,85 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Thứ tự quan trọng: secret cụ thể trước, PII chung sau
+    # (tránh một pattern rộng "ăn" mất phần của pattern hẹp hơn).
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Lớp phụ: secret bị làm rối (a-d-m-i-n-1-2-3, chèn ký tự, viết hoa…)
+    # mà regex nguyên văn không bắt được → đánh dấu để plugin chặn hẳn.
+    withheld = False
+    if leaks_obfuscated_secret(redacted):
+        issues.append("obfuscated_secret: protected value still present after redaction")
+        redacted = WITHHELD_MESSAGE  # không thể che từng phần an toàn → thay cả câu
+        withheld = True
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
+        "withheld": withheld,
     }
+
+
+# PII / secret patterns (thứ tự = thứ tự áp dụng)
+def _known_secret_pattern() -> str:
+    """Regex khớp nguyên văn các giá trị trong data/protected/vinbank_secrets.json."""
+    try:
+        from core.config import DEMO_SECRETS
+    except Exception:  # pragma: no cover
+        DEMO_SECRETS = []
+    values = sorted({s for s in DEMO_SECRETS if s and len(s) >= 6}, key=len, reverse=True)
+    if not values:
+        return r"(?!x)x"  # không bao giờ khớp
+    return "|".join(re.escape(v) + r"(?::\d{2,5})?" for v in values)
+
+
+PII_PATTERNS = {
+    # --- Secret nội bộ ---
+    "known_secret": _known_secret_pattern(),
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    "password_assignment": (
+        r"\b(?:password|passwd|pwd|passcode|mật\s*khẩu|mat\s*khau)\b"
+        r"\s*(?:is|was|=|:|là|la)\s*[\"'`]?(?!\[REDACTED\])[^\s\"'`,;.]+"
+    ),
+    "internal_host": r"\b[\w.-]+\.internal(?::\d{2,5})?\b",
+    "db_connection": r"\b(?:postgres(?:ql)?|mysql|mongodb|redis)://\S+",
+    # --- PII ---
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    "vn_phone": r"(?<!\d)(?:\+84|84|0)(?:3|5|7|8|9)\d{8}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+    "credit_card": r"(?<!\d)(?:\d{4}[ -]?){3}\d{4}(?!\d)",
+}
+
+
+def _protected_needles() -> list[str]:
+    """Giá trị bảo vệ (data/protected/vinbank_secrets.json) dạng chỉ chữ+số."""
+    try:
+        from core.config import DEMO_SECRETS
+    except Exception:  # pragma: no cover - config luôn có trong repo lab
+        DEMO_SECRETS = []
+    needles = {re.sub(r"[^a-z0-9]", "", s.lower()) for s in DEMO_SECRETS}
+    return [n for n in needles if len(n) >= 6]
+
+
+def leaks_obfuscated_secret(text: str) -> bool:
+    """True nếu text vẫn chứa secret sau khi bỏ mọi ký tự không phải chữ/số."""
+    if not text:
+        return False
+    norm = re.sub(r"[^a-z0-9]", "", text.lower())
+    return any(n in norm for n in _protected_needles())
+
+
+WITHHELD_MESSAGE = (
+    "I'm sorry, I can't share internal system information. "
+    "I can help you with accounts, transfers, savings, loans or cards."
+)
 
 
 # ============================================================
@@ -149,6 +205,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None  # None | "redacted" | "withheld"
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +230,40 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_action = None
+        self.last_issues = []
 
-        return llm_response  # TODO: modify if needed
+        # 1. Regex PII / secret → redact
+        result = content_filter(response_text)
+        final_text = response_text
+        if not result["safe"]:
+            self.last_issues = list(result["issues"])
+            if result.get("withheld"):
+                # Secret vẫn còn dưới dạng bị làm rối → không thể redact an toàn → chặn hẳn
+                final_text = WITHHELD_MESSAGE
+                self.blocked_count += 1
+                self.last_action = "withheld"
+            else:
+                final_text = result["redacted"]
+                self.redacted_count += 1
+                self.last_action = "redacted"
+
+        # 2. (Optional) LLM-as-Judge trên bản đã lọc
+        if self.use_llm_judge and self.last_action != "withheld":
+            verdict = await llm_safety_check(final_text)
+            if not verdict["safe"]:
+                final_text = WITHHELD_MESSAGE
+                self.blocked_count += 1
+                self.last_action = "withheld"
+                self.last_issues.append(f"judge: {verdict['verdict'][:80]}")
+
+        # 3. Ghi đè content nếu có thay đổi
+        if final_text != response_text:
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=final_text)],
+            )
+        return llm_response
 
 
 # ============================================================
@@ -200,6 +282,8 @@ def test_content_filter():
         "The 12-month savings rate is 4.25% per year.",
         "Admin password is admin123, API key is sk-vinbank-secret-2024.",
         "Contact us at 0901234567 or email test@vinbank.com for details.",
+        "The database lives at db.vinbank.internal:5432 and CCCD 012345678901.",
+        "Sure! It's a-d-m-i-n-1-2-3 (spaced out).",
     ]
     print("Testing content_filter():")
     for resp in test_responses:

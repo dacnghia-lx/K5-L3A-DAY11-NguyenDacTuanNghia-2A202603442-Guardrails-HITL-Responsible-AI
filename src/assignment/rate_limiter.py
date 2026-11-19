@@ -7,10 +7,16 @@ guardrail layers do not address (flooding / cost attacks).
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from contextvars import ContextVar
 import time
 
 from google.adk.plugins import base_plugin
 from google.genai import types
+
+# OpenAIRunner (Blue) luôn truyền invocation_context.user_id = "student".
+# Pipeline set ContextVar này để rate limit đúng theo từng user thật;
+# nếu không set thì fallback về invocation_context.user_id (ADK thật).
+current_user_id: ContextVar[str | None] = ContextVar("current_user_id", default=None)
 
 
 class RateLimitPlugin(base_plugin.BasePlugin):
@@ -33,17 +39,34 @@ class RateLimitPlugin(base_plugin.BasePlugin):
     async def on_user_message_callback(self, *, invocation_context, user_message):
         """Return Content to block, or None to allow."""
         self.total_count += 1
-        user_id = getattr(invocation_context, "user_id", None) or "anonymous"
+        user_id = (
+            current_user_id.get()
+            or getattr(invocation_context, "user_id", None)
+            or "anonymous"
+        )
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Trượt cửa sổ: bỏ các timestamp đã ra khỏi window
+        while window and window[0] <= now - self.window_seconds:
+            window.popleft()
+
+        # 2. Đã đủ quota trong window → chặn, KHÔNG ghi timestamp (không gia hạn phạt)
+        if len(window) >= self.max_requests:
+            wait = max(0.0, self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            return self._block_response(
+                f"Rate limit exceeded: max {self.max_requests} requests per "
+                f"{self.window_seconds}s. Try again in {wait:.0f}s."
+            )
+
+        # 3. Còn quota → ghi nhận và cho qua
+        window.append(now)
+        return None
+
+    def reset(self, user_id: str | None = None) -> None:
+        """Xoá cửa sổ của một user (hoặc tất cả) — dùng giữa các nhóm test."""
+        if user_id is None:
+            self.user_windows.clear()
+        else:
+            self.user_windows.pop(user_id, None)
